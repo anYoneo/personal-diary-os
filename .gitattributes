@@ -1,0 +1,17 @@
+# Shell scripts and Docker/build files MUST keep LF endings.
+# Windows checkouts otherwise write CRLF, and Linux then fails with
+#   /bin/bash^M: bad interpreter: No such file or directory
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+
+# Windows batch helpers, if any
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary

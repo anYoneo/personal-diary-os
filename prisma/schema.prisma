@@ -1,0 +1,342 @@
+// Personal Diary OS — relational schema (SQLite dev / Postgres prod)
+// Design notes live in docs/ARCHITECTURE.md (single-user per account, soft delete,
+// day-key denormalized for timeline/streak/on-this-day, outbox queue for Discord).
+
+generator client {
+  provider      = "prisma-client-js"
+  // Explicit, because detection depends on `openssl` being installed at build
+  // time. Debian bookworm ships OpenSSL 3; without this, a slim build image
+  // makes Prisma generate the openssl-1.1.x engine, and `new PrismaClient()`
+  // then fails at runtime with "could not locate the Query Engine".
+  // Prisma 6 supports: debian-openssl-3.0.x, debian-openssl-1.1.x,
+  // linux-musl-openssl-3.0.x, darwin-arm64, windows.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  passwordHash String
+  timezone     String   @default("Asia/Jakarta")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions    Session[]
+  entries     Entry[]
+  tags        Tag[]
+  threads     Thread[]
+  goals       Goal[]
+  thoughts    UnresolvedThought[]
+  reminders   Reminder[]
+  attachments Attachment[]
+  insights    AiInsight[]
+  auditLogs   AuditLog[]
+  discord     DiscordLink?
+  outbox      NotificationOutbox[]
+  settings    UserSettings?
+  linkCodes   LinkCode[]
+  signupCodes SignupCode[]
+
+  /// Which invite code let this account in. Audit trail for a closed beta.
+  betaCodeUsed String?
+}
+
+/// Notification/Timezone preferences. Kept apart from User so auth stays slim.
+model UserSettings {
+  id                     String   @id @default(cuid())
+  userId                 String   @unique
+  timezone               String   @default("Asia/Jakarta")
+  notifyOnEntry          Boolean  @default(true)
+  notifyOnReminder       Boolean  @default(true)
+  weeklyReflection       Boolean  @default(true)
+  onThisDay              Boolean  @default(true)
+  reflectionPrompt       Boolean  @default(true)
+  quietHoursStart        Int?
+  quietHoursEnd          Int?
+  updatedAt              DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Entry {
+  id         String    @id @default(cuid())
+  userId     String
+  title      String?
+  content    String
+  entryType  String    @default("daily") // daily|reflection|idea|work|personal|goal|achievement|problem|lesson|random
+  mood       String?
+  occurredAt DateTime
+  day        String // local calendar day YYYY-MM-DD (user timezone)
+  location   String?
+  isImportant Boolean  @default(false)
+  source     String    @default("web") // web|discord|api
+  sourceRef  String? // discord message id / external ref
+  wordCount  Int       @default(0)
+  version    Int       @default(1)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tags        EntryTag[]
+  threads     EntryThread[]
+  attachments Attachment[]
+  goals       Goal[]
+  thoughtFirst UnresolvedThought[] @relation("ThoughtFirstEntry")
+  thoughtLast  UnresolvedThought[] @relation("ThoughtLastEntry")
+  insights    AiInsight[]
+  outbox      NotificationOutbox[]
+
+  @@index([userId, occurredAt])
+  @@index([userId, day])
+  @@index([userId, deletedAt])
+  @@index([userId, entryType])
+  @@index([sourceRef])
+}
+
+model Tag {
+  id     String @id @default(cuid())
+  userId String
+  name   String
+  slug   String
+  color  String?
+
+  user    User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries EntryTag[]
+
+  @@unique([userId, slug])
+}
+
+model EntryTag {
+  entryId String
+  tagId   String
+
+  entry Entry @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  tag   Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([entryId, tagId])
+  @@index([tagId])
+}
+
+/// Long-running life threads: career, health, a project, a person, a place, a topic.
+model Thread {
+  id          String    @id @default(cuid())
+  userId      String
+  name        String
+  slug        String
+  kind        String    @default("topic") // life|project|person|place|topic
+  description String?
+  color       String?
+  status      String    @default("active") // active|dormant|archived
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entries EntryThread[]
+  goals   Goal[]
+
+  @@unique([userId, slug])
+  @@index([userId, status])
+}
+
+model EntryThread {
+  entryId  String
+  threadId String
+  entry    Entry  @relation(fields: [entryId], references: [id], onDelete: Cascade)
+  thread   Thread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  @@id([entryId, threadId])
+  @@index([threadId])
+}
+
+model Goal {
+  id          String    @id @default(cuid())
+  userId      String
+  title       String
+  detail      String?
+  status      String    @default("open") // open|done|dropped
+  threadId    String?
+  targetDate  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+  entryId     String? // entry that first stated the goal
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  thread Thread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+  entry  Entry?  @relation(fields: [entryId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+}
+
+/// Never auto-detected. Created manually (or from an accepted AI suggestion) so the
+/// system never assumes something is unresolved.
+model UnresolvedThought {
+  id           String    @id @default(cuid())
+  userId       String
+  question     String
+  note         String?
+  status       String    @default("open") // open|resolved|dropped
+  threadId     String?
+  firstEntryId String?
+  lastEntryId  String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  resolvedAt   DateTime?
+  resolvedNote String?
+
+  user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  firstEntry Entry? @relation("ThoughtFirstEntry", fields: [firstEntryId], references: [id], onDelete: SetNull)
+  lastEntry  Entry? @relation("ThoughtLastEntry", fields: [lastEntryId], references: [id], onDelete: SetNull)
+
+  @@index([userId, status])
+}
+
+model Reminder {
+  id         String    @id @default(cuid())
+  userId     String
+  text       String
+  remindAt   DateTime
+  recurrence String    @default("none") // none|daily|weekly|monthly
+  channel    String    @default("discord")
+  status     String    @default("pending") // pending|sent|failed|cancelled
+  sentAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, remindAt])
+}
+
+model Attachment {
+  id          String   @id @default(cuid())
+  userId      String
+  entryId     String?
+  filename    String
+  mimeType    String
+  size        Int
+  storagePath String
+  sha256      String
+  createdAt   DateTime @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entry Entry? @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([entryId])
+}
+
+/// AI output only. Original entry text is never rewritten by the system.
+model AiInsight {
+  id          String   @id @default(cuid())
+  userId      String
+  subjectType String // entry|day|week|month|thread|thought
+  subjectId   String?
+  kind        String // summary|tags|entities|reflection|pattern|similar|contradiction
+  model       String   @default("none")
+  content     String // JSON payload
+  createdAt   DateTime @default(now())
+  entryId     String?
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entry Entry? @relation(fields: [entryId], references: [id], onDelete: Cascade)
+
+  @@index([userId, subjectType, subjectId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String
+  action    String // entry.delete, entry.restore, user.login, ...
+  entity    String
+  entityId  String?
+  meta      String? // JSON, never diary content
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model DiscordLink {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  discordUserId String   @unique
+  username      String?
+  guildId       String?
+  linkedAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Short-lived code shown in the webapp and typed into Discord with /link.
+/// This keeps account linking explicit — the bot never auto-trusts a DM sender.
+model LinkCode {
+  id        String    @id @default(cuid())
+  userId    String
+  code      String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+/// Invite codes for registration. Sign-up is invite-only, so a public URL never
+/// lets a stranger create an account on someone else's server.
+model SignupCode {
+  id        String    @id @default(cuid())
+  code      String    @unique
+  note      String?
+  /// How many accounts this code may create. 1 = single use.
+  maxUses   Int       @default(1)
+  usedCount Int       @default(0)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  createdBy String?
+
+  users User[]
+}
+
+/// Event → outbox → Discord worker. Keeps Discord transport out of diary logic.
+model NotificationOutbox {
+  id          String    @id @default(cuid())
+  userId      String
+  kind        String // entry.created|reminder.due|reflection.weekly|memory.on_this_day
+  payload     String // JSON
+  status      String    @default("pending") // pending|sent|failed|skipped
+  attempts    Int       @default(0)
+  scheduledFor DateTime @default(now())
+  sentAt      DateTime?
+  error       String?
+  entryId     String?
+  createdAt   DateTime  @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  entry Entry? @relation(fields: [entryId], references: [id], onDelete: SetNull)
+
+  @@index([status, scheduledFor])
+  @@index([userId])
+}

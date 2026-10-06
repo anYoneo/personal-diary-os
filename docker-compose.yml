@@ -1,0 +1,83 @@
+# Oracle Cloud Always Free (ARM Ampere A1, 2 OCPU / 12 GB) deployment.
+#
+#   docker compose --env-file .env.production up -d --build
+#
+# Three services from ONE image: web, worker, bot. They share the /data volume,
+# so the diary file survives `docker compose up --build` and image upgrades.
+#
+# Prefer pm2 (scripts/ecosystem.config.cjs) on the Oracle host instead; it writes
+# less to the 47 GB boot volume and restarts faster. This file exists for
+# machines that are already comfortable with Docker.
+
+services:
+  web:
+    build: .
+    image: personal-diary-os:latest
+    container_name: diary-web
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      DATABASE_URL: "file:/data/diary.db"
+      NODE_ENV: "production"
+      PORT: "3111"
+      HOSTNAME: "0.0.0.0"
+    ports:
+      # Bind to loopback by default: nothing reaches the app except through a
+      # tunnel. Override for a host that proxies to a fixed port, e.g.
+      #   WEB_BIND=0.0.0.0 WEB_PORT=80     (dalang.io free subdomain → port 80)
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-3111}:3111"
+    volumes:
+      - diary-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3111/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+
+  worker:
+    # Never builds — it uses the image that `web` builds. Three services with
+    # `build:` on the same tag race each other and fail with
+    # 'image ...: already exists'.
+    image: personal-diary-os:latest
+    container_name: diary-worker
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      DATABASE_URL: "file:/data/diary.db"
+      NODE_ENV: "production"
+    # Reminders, reflections, and outbox delivery. Long-lived by design.
+    command: ["npm", "run", "worker"]
+    # The image healthcheck probes the WEB port; this process does not listen on
+    # it, so inheriting it would report a permanent false "unhealthy".
+    healthcheck:
+      disable: true
+    volumes:
+      - diary-data:/data
+    depends_on:
+      web:
+        condition: service_healthy
+
+  bot:
+    # Never builds — same image as `web` (see the note on `worker`).
+    image: personal-diary-os:latest
+    container_name: diary-bot
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      DATABASE_URL: "file:/data/diary.db"
+      NODE_ENV: "production"
+    # Slash commands only. DM capture stays off unless DISCORD_CAPTURE_DMS=true
+    # in .env.production — see README ("Two guardrails").
+    command: ["npm", "run", "bot"]
+    # Same reason as `worker`: no HTTP listener to probe.
+    healthcheck:
+      disable: true
+    volumes:
+      - diary-data:/data
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  diary-data:

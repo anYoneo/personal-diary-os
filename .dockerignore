@@ -1,0 +1,30 @@
+# Build context exclusions — keeps the image small AND keeps secrets/private data out of it.
+**/node_modules
+**/.next
+**/out
+**/build
+
+# Never bake credentials or the diary itself into an image.
+.env
+.env.*
+!.env.example
+
+# The real diary lives here. It must be mounted at runtime, never copied in.
+prisma/*.db
+prisma/*.db-journal
+prisma/*.db-wal
+prisma/*.db-shm
+prisma/data
+uploads
+
+# dev/test noise
+coverage
+.vscode
+.idea
+.DS_Store
+*.log
+*.tsbuildinfo
+.git
+.gitignore
+.vitest
+prisma/test.db*
